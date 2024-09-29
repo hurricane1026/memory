@@ -72,9 +72,9 @@ class StringMap : public std::conditional_t<is_map_v<Value>, base_table_type_map
     using second_hasher = SecondHash;
 
    private:
-    bucket_ptr _buckets;
-    size_t _num_buckets;
-    size_t _max_bucket_capacity;
+    bucket_ptr _buckets{};
+    size_t _num_buckets = 0;
+    size_t _max_bucket_capacity = 0;
     float _max_load_factor = kDefaultMaxLoadFactor;
     Hash _hash{};
     SecondHash _second_hash{};
@@ -110,6 +110,10 @@ class StringMap : public std::conditional_t<is_map_v<Value>, base_table_type_map
 
     explicit StringMap(stdb::memory::Arena& arena) : _arena(arena) {}
 
+   private:
+    [[nodiscard]] static constexpr auto at(bucket_ptr bucket_ptr, size_t offset) -> Bucket& {
+        return *(bucket_ptr + static_cast<typename std::allocator_traits<bucket_alloc>::difference_type>(offset));
+    }
 };  // class StringMap of String
     
 
