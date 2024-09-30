@@ -1,4 +1,7 @@
+#include <cstdint>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include "container/stdb_vector.hpp"
@@ -134,7 +137,8 @@ class StringMap {
     // and if SecondHash is not Void, the Key should be std::pair<Hash, Key>
 
    public:
-    class Iterator {
+    class Iterator
+    {
         using bucket_ptr = const Bucket*;
        private:
         bucket_ptr _ptr = nullptr;
@@ -143,7 +147,13 @@ class StringMap {
         explicit Iterator(bucket_ptr ptr): _ptr(ptr) {}
 
         auto operator*() const -> std::pair<Key, Value> {
-            return {_ptr->extract_key(), _ptr->extract_value()};
+            // the _ptr is nullptr or not, the checking should be done in the caller
+            if constexpr (std::is_void_v<Value>) {
+                return {_ptr->extract_key(), {}};
+            }
+            else {
+                return {_ptr->extract_key(), _ptr->extract_value()};
+            }
         }
 
         auto operator->() const -> std::pair<Key, Value>* {
@@ -168,7 +178,7 @@ class StringMap {
         auto operator!=(const Iterator& other) const -> bool {
             return !(*this == other);
         }
-    }; // class Iterator
+    };  // class Iterator
 
    private:
     stdb::memory::Arena& _arena;
@@ -181,17 +191,40 @@ class StringMap {
     using hasher = Hash;
     using second_hasher = SecondHash;
     using block_difference_type = std::pointer_traits<bucket_type*>::difference_type;
-    using const_iterator = Iterator;
 
    private:
     using dist_and_fingerprint_type = decltype(Bucket::dist_and_fingerprint);
     bucket_ptr _buckets{};
-    size_t _nbuckets = 0;
-    size_t _max_bucket_capacity = 0;
+    uint32_t _nbuckets = 0;
+    uint32_t _max_bucket_capacity = 0;
+    uint32_t _size = 0;
     float _max_load_factor = kDefaultMaxLoadFactor;
+    static_assert(sizeof(_max_load_factor) == 4, "max_load_factor should be 4 bytes");
     Hash _hash{};
     SecondHash _second_hash{};
     uint8_t _shifts = kInitialShift;
+
+    [[nodiscard]] constexpr auto calc_shifts_for_size(size_t size) -> uint8_t {
+        auto shifts = kInitialShift;
+        while (shifts > 0 &&
+               static_cast<size_t>(static_cast<float>(calc_num_buckets(shifts)) * _max_load_factor) < size) {
+            --shifts;
+        }
+        return shifts;
+    }
+
+    [[nodiscard]] static constexpr auto calc_num_buckets(uint8_t shifts) -> uint32_t {
+        return std::min(max_bucket_count(),
+                        uint32_t{1} << (static_cast<uint32_t>(std::numeric_limits<uint64_t>::digits) - shifts));
+    }
+
+    [[nodiscard, gnu::always_inline]] static constexpr auto max_size() -> uint32_t {
+        return std::numeric_limits<bucket_index_type>::max();
+    }
+
+    [[nodiscard, gnu::always_inline]] static constexpr auto max_bucket_count() -> uint32_t {
+        return max_size();
+    }
 
     [[nodiscard]] constexpr auto dist_and_fingerprint_from_hash(uint64_t hash) const -> dist_and_fingerprint_type {
         return Bucket::dist_inc | (static_cast<dist_and_fingerprint_type>(hash) & Bucket::fingerprint_mask);
@@ -235,11 +268,11 @@ class StringMap {
         return false;
     }
 
-    [[nodiscard]] auto end() const -> const_iterator {
+    [[nodiscard]] auto end() const -> Iterator<void> {
         return {};
     }
     
-    [[nodiscard]] auto end() -> iterator {
+    [[nodiscard]] auto end() -> Iterator<void> {
         return {};
     }
 
@@ -248,12 +281,12 @@ class StringMap {
         return *(bucket + static_cast<block_difference_type>(offset));
     }
 
-    [[nodiscard]] static constexpr auto dist_increase(dist_and_fingerprint_type x) -> dist_and_fingerprint_type {
-        return static_cast<dist_and_fingerprint_type>(x + Bucket::dist_inc);
+    [[nodiscard]] static constexpr auto dist_increase(dist_and_fingerprint_type dist) -> dist_and_fingerprint_type {
+        return static_cast<dist_and_fingerprint_type>(dist + Bucket::dist_inc);
     }
 
-    [[nodiscard]] static constexpr auto dist_decrease(dist_and_fingerprint_type x) -> dist_and_fingerprint_type {
-        return static_cast<dist_and_fingerprint_type>(x - Bucket::dist_inc);
+    [[nodiscard]] static constexpr auto dist_decrease(dist_and_fingerprint_type dist) -> dist_and_fingerprint_type {
+        return static_cast<dist_and_fingerprint_type>(dist - Bucket::dist_inc);
     }
 
     [[nodiscard]] auto next(bucket_index_type bucket_idx) -> bucket_index_type {
@@ -270,13 +303,12 @@ class StringMap {
         }
     }
 
-    template<typename K>
-    [[nodiscard]] constexpr auto mixed_hash(K const& key) const -> uint64_t {
+    [[nodiscard]] constexpr auto mixed_hash(std::string_view key) const -> uint64_t {
         return _hash(key);
     }
 
-    template<typename K>
-    auto do_find(K const& key) -> const_iterator {
+    template<typename V>
+    auto do_find(Key key) -> Iterator<V> {
         if (empty()) [[unlikely]] {
             return end();
         }
@@ -319,20 +351,84 @@ class StringMap {
         }
     }
 
-    template<typename K>
-    auto do_find(K const& key) const -> const_iterator {
+    auto do_find(Key key) const -> Iterator {
         return do_find(key);
     }
 
-
     template<typename ... Args>
-    auto do_place_element(dist_and_fingerprint_type dist_and_fingerprint, bucket_index_type bucket_idx  , Args&&... args) -> std::pair<const_iterator, bool> {
-
+    auto do_emplace_kv_to_arena(Key key, Args&&... args) -> std::pair<const char*, uint32_t> {
+        char* new_key = nullptr;
+        uint32_t key_size = 0;
+        // emplace the new key to Arena.
+        if constexpr (MaxKeySize >= 0) {
+            if (key.size() > MaxKeySize) {
+                // just move the key, and do not copy the content of the key to the Arena
+                new_key = _arena.Create<Key>(std::move(key));
+            } else {
+                // copy the key into Arena
+                new_key = _arena.CreateArray<char>(key.size());
+                std::memcpy(new_key, key.data(), key.size());
+                key_size = key.size();
+            }
+        } else {
+            // copy the same code as the above to avoid a if branch.
+            // just copy the char[] to Arena, no destructure, no move.
+            new_key = _arena.CreateArray<char>(key.size());
+            std::memcpy(new_key, key.data(), key.size());
+            key_size = key.size();
+        }
+        // if the map is not set, then emplace the value to Arena
+        if constexpr (not std::is_void_v<Value>) {
+            // emplace the value to Arena
+            _arena.Create<Value>(std::forward<Args>(args)...);
+        }
+        // increase the size of the map
+        _size++;
+        return {new_key, key_size};
     }
 
-    template<typename K, typename... Args>
-    auto do_try_emplace(K&& key, Args&&... args) -> std::pair<const_iterator, bool> {
+    [[nodiscard]] auto is_full() const -> bool {
+        return _size > _max_bucket_capacity;
     }
+
+    void increase_size() {
+        if (_max_bucket_capacity == max_bucket_count()) [[unlikely]] {
+            // throw an error
+            throw std::overflow_error("the map is full");
+        }
+        --_shifts;
+    }
+
+    void deallocate_buckets() {
+        if (_buckets != nullptr) {
+            std::free(_buckets);
+            _buckets = nullptr;
+        }
+        _nbuckets = 0;
+        _max_bucket_capacity = 0;
+    }
+
+   void allocate_buckets_from_shift() {
+    _nbuckets = calc_num_buckets(_shifts);
+    _buckets = static_cast<bucket_ptr>(std::malloc(sizeof(Bucket) * _nbuckets));
+    if (_nbuckets == max_bucket_count()) {
+        // reached the maximum, make sure we can use each bucket
+        _max_bucket_capacity = max_bucket_count();
+    } else {
+        _max_bucket_capacity = static_cast<bucket_index_type>(static_cast<float>(_nbuckets) * _max_load_factor);
+    }
+
+   }
+    
+
+    template <typename... Args>
+    auto do_place_element(dist_and_fingerprint_type dist_and_fingerprint, bucket_index_type bucket_idx,
+                          Args&&... args) -> std::pair<Iterator, bool> {
+
+                          }
+
+    template <typename K, typename... Args>
+    auto do_try_emplace(K&& key, Args&&... args) -> std::pair<const_iterator, bool> {}
 };  // class StringMap of String
     
 
