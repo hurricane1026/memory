@@ -30,6 +30,7 @@ constexpr bool is_map_v = !std::is_void_v<Mapped>;
 
 namespace bucket_type {
 
+/*
 template<size_t BlockSize>
 struct small {
     static constexpr uint32_t dist_inc = 1U << 8U;             // skip 1 byte fingerprint
@@ -56,6 +57,8 @@ struct small {
 }; // struct small
 
 static_assert(sizeof(small<4>) == sizeof(void*), "small bucket size should be 16");
+
+*/
 
 struct mediam {
     static constexpr uint32_t dist_inc = 1U << 8U;             // skip 1 byte fingerprint
@@ -277,7 +280,7 @@ class StringMap {
     }
 
    private:
-    [[nodiscard]] static constexpr auto at(bucket_ptr bucket, size_t offset) -> Bucket& {
+    [[nodiscard]] static constexpr auto at(bucket_ptr bucket, size_t offset) -> bucket_type& {
         return *(bucket + static_cast<block_difference_type>(offset));
     }
 
@@ -408,18 +411,43 @@ class StringMap {
         _max_bucket_capacity = 0;
     }
 
-   void allocate_buckets_from_shift() {
-    _nbuckets = calc_num_buckets(_shifts);
-    _buckets = static_cast<bucket_ptr>(std::malloc(sizeof(Bucket) * _nbuckets));
-    if (_nbuckets == max_bucket_count()) {
-        // reached the maximum, make sure we can use each bucket
-        _max_bucket_capacity = max_bucket_count();
-    } else {
-        _max_bucket_capacity = static_cast<bucket_index_type>(static_cast<float>(_nbuckets) * _max_load_factor);
+    void allocate_buckets_from_shift() {
+        _nbuckets = calc_num_buckets(_shifts);
+        _buckets = static_cast<bucket_ptr>(std::malloc(sizeof(Bucket) * _nbuckets));
+        if (_nbuckets == max_bucket_count()) {
+            // reached the maximum, make sure we can use each bucket
+            _max_bucket_capacity = max_bucket_count();
+        } else {
+            _max_bucket_capacity = static_cast<bucket_index_type>(static_cast<float>(_nbuckets) * _max_load_factor);
+        }
     }
 
-   }
-    
+    // use template to accept multi types of string, and return the bucket
+    template <typename K>
+    [[nodiscard]] auto next_while_less(const K& key) const -> bucket_type {
+        auto hash = mixed_hash(key);
+        auto dist_and_fingerprint = dist_and_fingerprint_from_hash(hash);
+        auto bucket_idx = bucket_idx_from_hash(hash);
+
+        while (dist_and_fingerprint < at(_buckets, bucket_idx).dist_and_fingerprint) {
+            dist_and_fingerprint = dist_increase(dist_and_fingerprint);
+            bucket_idx = next(bucket_idx);
+        }
+        return {dist_and_fingerprint, bucket_idx};
+    }
+
+    void fill_new_buckets_from_old_buckets() {
+        for (bucket_index_type bucket_idx = 0; bucket_idx < _nbuckets; ++bucket_idx) {
+            auto& bucket = at(_buckets, bucket_idx);
+            if (bucket.is_empty()) {
+                continue;
+            }
+            // do something with the bucket
+        }
+        auto key = bucket.extract_key();
+        auto 
+    }
+
 
     template <typename... Args>
     auto do_place_element(dist_and_fingerprint_type dist_and_fingerprint, bucket_index_type bucket_idx,
