@@ -66,7 +66,7 @@ struct mediam {
 
     uint64_t dist_and_fingerprint; // upper 3 byte: distance to original bucket. lower byte: fingerprint from hash
     uint16_t key_length; // key length, if key length is greater than 2**16, then use 0
-    uint64_t key_address:48; 
+    uint64_t key_address:48;  // the ptr points to the key in the arena
 
     [[nodiscard]] auto equal(uint32_t other_dist_and_fingerprint, std::string_view other_key) const -> bool {
         return other_dist_and_fingerprint == this->dist_and_fingerprint && other_key == extract_key();
@@ -93,7 +93,7 @@ struct double_hash_mediam {
     uint32_t dist_and_fingerprint; // upper 3 byte: distance to original bucket. lower byte: fingerprint from hash
     uint32_t second_hash; // will need more computation for once more hashing while emplace or find
     uint16_t key_length; // key length, if key length is greater than 2**16, then use 0
-    uint64_t key_address:48; 
+    uint64_t key_address:48;  // the ptr points to the key in the arena
 
     [[nodiscard]] auto equal(uint32_t other_dist_and_fingerprint, uint32_t other_second_hash, std::string_view other_key) const -> bool {
         return other_dist_and_fingerprint == this->dist_and_fingerprint && other_second_hash == this->second_hash && other_key == extract_key();
@@ -280,8 +280,8 @@ class StringMap {
     }
 
    private:
-    [[nodiscard]] static constexpr auto at(bucket_ptr bucket, size_t offset) -> bucket_type& {
-        return *(bucket + static_cast<block_difference_type>(offset));
+    [[nodiscard]] static constexpr auto at_ptr(bucket_ptr bucket, uint32_t offset) -> bucket_ptr {
+        return bucket + static_cast<block_difference_type>(offset);
     }
 
     [[nodiscard]] static constexpr auto dist_increase(dist_and_fingerprint_type dist) -> dist_and_fingerprint_type {
@@ -319,7 +319,7 @@ class StringMap {
         auto the_mixed_hash = mixed_hash(key);
         auto dist_and_fingerprint = dist_and_fingerprint_from_hash(the_mixed_hash);
         auto bucket_idx = bucket_idx_from_hash(the_mixed_hash);
-        auto* bucket = &at(_buckets, bucket_idx);
+        auto* bucket = at_ptr(_buckets, bucket_idx);
 
         // unrolled loop. *Always* check a few directly, then enter the loop. This is faster.
         if (bucket->equal(dist_and_fingerprint, key)) {
@@ -329,7 +329,7 @@ class StringMap {
         // the second loop
         dist_and_fingerprint = dist_increase(dist_and_fingerprint);
         bucket_idx = next(bucket_idx);
-        bucket = &at(_buckets, bucket_idx);
+        bucket = at_ptr(_buckets, bucket_idx);
 
         if (bucket->equal(dist_and_fingerprint, key)) {
             return iterator(bucket);
@@ -338,7 +338,7 @@ class StringMap {
         // into the loop
         dist_and_fingerprint = dist_increase(dist_and_fingerprint);
         bucket_idx = next(bucket_idx);
-        bucket = &at(_buckets, bucket_idx);
+        bucket = at_ptr(_buckets, bucket_idx);
 
         while (true) {
             if (bucket->equal(dist_and_fingerprint, key)) {
@@ -350,7 +350,7 @@ class StringMap {
 
             dist_and_fingerprint = dist_increase(dist_and_fingerprint);
             bucket_idx = next(bucket_idx);
-            bucket = &at(_buckets, bucket_idx);
+            bucket = at_ptr(_buckets, bucket_idx);
         }
     }
 
@@ -429,23 +429,59 @@ class StringMap {
         auto dist_and_fingerprint = dist_and_fingerprint_from_hash(hash);
         auto bucket_idx = bucket_idx_from_hash(hash);
 
-        while (dist_and_fingerprint < at(_buckets, bucket_idx).dist_and_fingerprint) {
+        while (dist_and_fingerprint < at_ptr(_buckets, bucket_idx)->dist_and_fingerprint) {
             dist_and_fingerprint = dist_increase(dist_and_fingerprint);
             bucket_idx = next(bucket_idx);
         }
         return {dist_and_fingerprint, bucket_idx};
     }
 
-    void fill_new_buckets_from_old_buckets() {
+    void place_and_shift_up(bucket_type bucket, uint32_t place) {
+        while (0 != at_ptr(_buckets, place)->dist_and_fingerprint) {
+            // if the dist_and_fingerprint is not 0, then we need to replace the old bucket,
+            // and move the old bucket to the another empty place(slot)
+            bucket = std::exchange(*at_ptr(_buckets, place), bucket);
+            bucket.dist_and_fingerprint = dist_increase(bucket.dist_and_fingerprint);
+            place = next(place);
+        }
+        // the dist_and_fingerprint is 0, so it is safe to assign
+        *at_ptr(_buckets, place) = bucket;
+    }
+
+    void fill_new_buckets_from_arena() {
+        memory::stdb_vector<std::string_view> new_keys;
+        // reserve the size of the new_keys
+        new_keys.reserve(bucket_count());
         for (bucket_index_type bucket_idx = 0; bucket_idx < _nbuckets; ++bucket_idx) {
-            auto& bucket = at(_buckets, bucket_idx);
-            if (bucket.is_empty()) {
+            auto* bucket_ptr = at_ptr(_buckets, bucket_idx);
+            if (bucket_ptr->dist_and_fingerprint == 0) {
+                continue;
+            }
+            // do something with the bucket
+            new_keys.emplace_back(bucket.extract_key());
+        }
+        // the old buckets are useless by now, so we can clear them
+        clear_buckets();
+
+        // rehash the new_keys
+        for (auto& key : new_keys) {
+            auto [dist_and_fingerprint, bucket_idx] = next_while_less(key);
+            // we know for certain that key has not yet been inserted, so no need to check it.
+            place_and_shift_up({dist_and_fingerprint, bucket_idx}, bucket_idx);
+        }
+    }
+
+    void fill_new_buckets_from_old_buckets() {
+        auto* old_buckets = _buckets;
+        _buckets = 
+        for (bucket_index_type bucket_idx = 0; bucket_idx < _nbuckets; ++bucket_idx) {
+            auto* bucket_ptr = at_ptr(_buckets, bucket_idx);
+            if (bucket_ptr->dist_and_fingerprint == 0) {
                 continue;
             }
             // do something with the bucket
         }
-        auto key = bucket.extract_key();
-        auto 
+
     }
 
 
