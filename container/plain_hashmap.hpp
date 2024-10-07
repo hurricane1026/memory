@@ -3,30 +3,161 @@
 #include <limits>
 #include <algorithm>
 #include <cstring>
+#include "string/string.hpp"
+#include <concepts>
+#include <string_view>
+#include <type_traits>
 
 namespace stdb::container {
 
-template <typename Key, typename T, class Hash, class KeyEqual, template <typename> class Allocator>
+// StringLike is a concept that checks if a type is a string-like type.
+// It checks if the type has data() and size() methods that return the correct type.
+template <typename S>
+concept StringLike = requires(S str) {
+    // s.data() should return a char pointer or const char pointer
+    {str.data()} -> std::same_as<const char*>;
+    // s.size() should return a size_t
+    {str.size()} -> std::same_as<size_t>;
+} || requires(S str) {
+    // s.data() should return a char pointer or const char pointer
+    {str.data()} -> std::same_as<char*>;
+    // s.size() should return a size_t
+    {str.size()} -> std::same_as<size_t>;
+};
+
+namespace bucket_type {
+
+constexpr uint32_t dist_inc = 1U << 8U;
+
+static_assert(StringLike<memory::string>);
+static_assert(StringLike<std::string>);
+static_assert(StringLike<std::string_view>);
+
+template <std::integral Key, typename Value>
+    requires(sizeof(Key) <= sizeof(uint32_t))
+struct compact_32b_map_bucket
+{
+    uint32_t distance = {};
+    union {
+        Key key = {};
+        uint32_t hash;
+    };
+    Value value = {};
+};  // struct compact_int_key
+
+static_assert(sizeof(compact_32b_map_bucket<uint32_t, uint32_t>) == 3 * sizeof(uint32_t), "compact_int_key should be 12 bytes");
+static_assert(sizeof(compact_32b_map_bucket<int32_t, uint64_t>) == 2 * sizeof(uint64_t), "compact_int_key should be 16 bytes");
+
+
+template<std::integral Key, typename Value = void>
+    requires(sizeof(Key) <= sizeof(uint32_t))
+struct compact_32b_set_bucket {
+    uint32_t distance = {};
+    union {
+        Key key = {};
+        uint32_t hash;
+    };
+};  // struct compact_32b_set_bucket
+
+static_assert(sizeof(compact_32b_set_bucket<uint32_t>) == 2 * sizeof(uint32_t), "compact_32b_set_bucket should be 8 bytes");
+static_assert(sizeof(compact_32b_set_bucket<uint16_t>) == 2 * sizeof(uint32_t), "compact_32b_set_bucket should be 8 bytes");
+
+template <std::integral Key, typename Value>
+    requires(sizeof(Key) == sizeof(uint64_t))
+struct compact_64b_key_bucket {
+    uint32_t distance = {};
+    union {
+        Key key = {};
+        uint64_t hash;
+    };
+    Value value = {};
+};  // struct compact_long_key_bucket
+
+static_assert(sizeof(compact_64b_key_bucket<uint64_t, uint64_t>) == 3 * sizeof(uint64_t), "compact_long_key_bucket should be 24 bytes");
+static_assert(sizeof(compact_64b_key_bucket<int64_t, memory::string>) == 5 * sizeof(uint64_t), "compact_long_key_bucket should be 40 bytes");
+
+template<std::integral Key, typename Value = void>
+    requires(sizeof(Key) == sizeof(uint64_t))
+struct  compact_64b_set_bucket {
+    uint32_t distance = {}; // 8 bytes, even if the distance is 1, we need to use 8 bytes to store it, so just use 8 bytes.
+    union {
+        Key key = {};
+        uint64_t hash;
+    };
+};  // struct compact_long_set_bucket
+
+static_assert(sizeof(compact_64b_set_bucket<uint64_t>) == 4 * sizeof(uint32_t), "compact_long_set_bucket should be 16 bytes");
+static_assert(sizeof(compact_64b_set_bucket<int64_t>) == 4 * sizeof(uint32_t), "compact_long_set_bucket should be 16 bytes");
+
+template<StringLike Key, typename Value>
+struct compact_string_key_bucket {
+    uint32_t distance = {};
+    uint32_t hash = {}; // use 4 bytes hash is better than part of 8 bytes hash.
+    Key key = {};
+    Value value = {};
+};  // struct compact_string_key_bucket
+
+static_assert(sizeof(compact_string_key_bucket<memory::string, uint64_t>) == 5 * sizeof(uint64_t), "compact_long_hash should be 40 bytes");
+
+template<StringLike Key, typename Value=void>
+struct compact_string_set_bucket {
+    uint32_t distance = {};
+    uint32_t hash = {}; // use 4 bytes hash is better than part of 8 bytes hash.
+    Key key = {};
+};  // struct compact_string_set_bucket
+
+static_assert(sizeof(compact_string_set_bucket<memory::string>) == 4 * sizeof(uint64_t), "compact_string_set_bucket should be 24 bytes");
+
+// the loose means use 8 bytes to store the hash, 4 bytes to store the distance.
+template <StringLike Key, typename Value, bool IsValueLong = (sizeof(Value) > sizeof(uint32_t))>
+struct loose_string_key_bucket;
+
+template <StringLike Key, typename Value>
+struct loose_string_key_bucket<Key, Value, true>
+{
+    uint32_t distance = {}; // the Value has at least 8 bytes, so we can use 8 bytes to store the distance and hash.
+    uint64_t hash = {};  // use 4 bytes to store the hash, to save 8 bytes of memory in each bucket.
+    Key key = {};
+    Value value = {}; // at least 8 bytes
+};  // struct loose_string_key_bucket<Key, Value, true>
+
+template <StringLike Key, typename Value>
+struct loose_string_key_bucket<Key, Value, false>
+{
+    uint64_t hash = {}; // use 8 bytes to store the hash, make the risk of collision smaller.
+    uint32_t distance = {}; // make the disntace to after the hash, and in front of the value field, so that we can save a 8 bytes in each bucket.
+    Value value = {}; // at lea
+    Key key = {};
+};  // struct loose_string_key_bucket<Key, Value, false>
+
+static_assert(sizeof(loose_string_key_bucket<memory::string, uint64_t>) == 6 * sizeof(uint64_t), "loose_string_key_bucket should be 32 bytes");
+static_assert(sizeof(loose_string_key_bucket<memory::string, uint32_t>) == 5 * sizeof(uint64_t), "loose_string_key_bucket should be 32 bytes");
+
+template<StringLike Key, typename Value = void>
+struct loose_string_set_bucket {
+    uint32_t distance = {}; // 8 bytes, even if the distance is 1, we need to use 8 bytes to store it, so just use 8 bytes.
+    uint64_t hash = {}; // use 8 bytes to store the hash, make the risk of collision smaller.
+    Key key = {};
+};  // struct loose_string_set_bucket
+
+static_assert(sizeof(loose_string_set_bucket<memory::string>) == 5 * sizeof(uint64_t), "loose_string_set_bucket should be 24 bytes");
+
+}  // namespace bucket_type
+
+template <typename Key, typename T, template <typename, typename> class Bucket, class Hash, class KeyEqual, template <typename> class Allocator>
 class PlainHashMap
 {
+    using hash_type = decltype(Hash()(std::declval<Key>()));
+    using fingerprint_type = uint64_t;
     static constexpr uint8_t initial_shifts = 64 - 2; // 2^(64-m_shift) number of buckets
     static constexpr float default_max_load_factor = 0.8F;
 
-    struct Bucket_without_value {
-        static constexpr uint64_t dist_inc = 1U << 8U;
-        static constexpr uint64_t fingerprint_mask = dist_inc - 1;
-        uint64_t dist_and_fingerprint{};
-        Key key;
-    };
-    struct Bucket_with_value : Bucket_without_value {
-        T value;
-    };
+public:
 
-    using Bucket = std::conditional_t<std::is_same_v<T, void>, Bucket_without_value, Bucket_with_value>;
-    using bucket_ptr = Bucket*;
-    using bucket_alloc = Allocator<Bucket>;
-    using bucket_idx_type = uint32_t;
-    using hash_type = decltype(mixed_hash(std::declval<Key>()));
+    using bucket = Bucket<Key, T>;
+    using bucket_ptr = Bucket<Key, T>*;
+    using bucket_alloc = Allocator<bucket>;
+    using bucket_place_type = uint32_t;
    private:
     bucket_alloc _bucket_alloc;
     bucket_ptr _buckets = nullptr;
@@ -37,65 +168,52 @@ class PlainHashMap
     uint32_t _num_buckets = 0;
     uint32_t _max_bucket_capacity = 0;
     uint8_t _shift = initial_shifts;
-    using dist_and_fingerprint_type = decltype(Bucket::dist_and_fingerprint);
-
 
     [[nodiscard]] static constexpr auto max_bucket_count() -> uint64_t {
         return std::numeric_limits<uint32_t>::max();
     }
 
-    [[nodiscard]] auto next(uint32_t bucket_idx) -> uint32_t {
-        return (bucket_idx + 1U) % _num_buckets;
+    [[nodiscard]] auto next(uint32_t bucket_place) -> uint32_t {
+        return (bucket_place + 1U) % _num_buckets;
     }
 
-    [[nodiscard]] static constexpr auto at(bucket_ptr bucket_ptr, uint32_t offset) -> Bucket& {
+    [[nodiscard]] static constexpr auto at(bucket_ptr bucket_ptr, uint32_t offset) -> bucket& {
         return bucket_ptr[offset];
-    }
-
-    [[nodiscard]] static constexpr auto dist_inc(dist_and_fingerprint_type fingerprint) -> uint64_t {
-        return fingerprint + Bucket::dist_inc;
-    }
-
-    [[nodiscard]] static constexpr auto dist_dec(dist_and_fingerprint_type fingerprint) -> uint64_t {
-        return fingerprint - Bucket::dist_inc;
     }
 
    private:
     // HASHING implementation
-    [[gnu::always_inline, nodiscard]] auto mixed_hash(const Key& key) -> hash_type {
+    [[gnu::always_inline, nodiscard]] auto do_hash(const Key& key) -> hash_type {
         return _hasher(key);
     }
 
-    [[gnu::always_inline, nodiscard]] auto mixed_hash(Key key) -> hash_type { return _hasher(key); }
-
-    [[nodiscard]] auto dist_and_fingerprint_from_hash(hash_type hash) -> dist_and_fingerprint_type {
-        return Bucket::dist_inc | (static_cast<dist_and_fingerprint_type>(hash) & Bucket::fingerprint_mask);
-    }
-
-    [[nodiscard]] auto bucket_idx_from_hash(hash_type hash) -> bucket_idx_type {
+    // calculate the bucket index from the hash
+    [[nodiscard]] auto bucket_idx_from_hash(hash_type hash) -> bucket_place_type {
         return static_cast<uint32_t>(hash >> _shift);
     }
 
-    [[nodiscard]] static constexpr auto get_key(Bucket const& bucket) -> Key const& { return bucket.key; }
+    [[nodiscard]] static constexpr auto get_key(bucket const& bucket) -> Key const& { return bucket.key; }
 
-    [[nodiscard]] auto next_while_less(hash_type hash) const -> dist_and_fingerprint_type {
-        auto dist_and_fingprint = dist_and_fingerprint_from_hash(hash);
-        auto bucket_idx = bucket_idx_from_hash(hash);
+    [[nodiscard]] auto next_while_less(hash_type hash) const -> std::pair<bucket_place_type, bucket_place_type> {
+        auto bucket_place = bucket_idx_from_hash(hash);
+        auto distance = 0U;
 
-        while (dist_and_fingprint < at(_buckets, bucket_idx).dist_and_fingerprint) {
-            dist_and_fingprint = dist_inc(dist_and_fingprint);
-            bucket_idx = next(bucket_idx);
+        while (hash < at(_buckets, bucket_place).hash) {
+            distance++;
+            bucket_place = next(bucket_place);
         }
 
-        return {dist_and_fingprint, bucket_idx};
+        return {distance, bucket_place};
     }
 
-    void place_and_shift_up(Bucket bucket, bucket_idx_type place) {
-        while (0 != at(_buckets, place).dist_and_fingerprint) {
+    void place_and_shift_up(bucket bucket, bucket_place_type place) {
+        while (0 != at(_buckets, place).hash) {
             bucket = std::exchange(at(_buckets, place), std::move(bucket));
-            bucket.dist_and_fingerprint = dist_inc(bucket.dist_and_fingerprint);
+            bucket.distance++;
             place = next(place);
         }
+        // the bucket's hash is 0, so it is an empty bucket.
+        // no need to move the old bucket, just write the new bucket to the place.
         at(_buckets, place) = bucket;
     }
 
@@ -157,7 +275,7 @@ class PlainHashMap
             }
         }
         // clear the buckets's memory layout.
-        std::memset(_buckets, 0, sizeof(Bucket) * _num_buckets);
+        std::memset(_buckets, 0, sizeof(bucket) * _num_buckets);
     }
 
     void clear_and_fill_buckets_from_values() {
@@ -165,7 +283,7 @@ class PlainHashMap
         for (uint32_t i = 0; i < _num_buckets; ++i) {
             auto& bucket = at(_buckets, i);
 
-            
+            auto [dist_and_fingerprint, bucket_idx] = next_while_less(bucket.dist_and_fingerprint);
         }
     }
     
